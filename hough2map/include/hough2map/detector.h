@@ -1,257 +1,229 @@
 #ifndef HOUGH2MAP_DETECTOR_H_
 #define HOUGH2MAP_DETECTOR_H_
 
-#include <custom_msgs/orientationEstimate.h>
-#include <custom_msgs/positionEstimate.h>
-#include <custom_msgs/velocityEstimate.h>
 #include <dvs_msgs/Event.h>
 #include <dvs_msgs/EventArray.h>
-#include <geometry_msgs/PoseArray.h>
 #include <ros/ros.h>
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/image_encodings.h>
-
 #include <Eigen/Dense>
-#include <boost/align/aligned_allocator.hpp>
-#include <cmath>
 #include <cv_bridge/cv_bridge.h>
-#include <deque>
-#include <fstream>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include <iostream>
-#include <omp.h>
+#include <opencv2/calib3d.hpp>
 #include <opencv2/core/eigen.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
+
+#include <cmath>
+#include <cstring>
+#include <deque>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <queue>
+#include <map>
 #include <vector>
+
+// General Parameters
+constexpr int32_t kHoughSpaceHeight = 480 + 2;
+constexpr int32_t kHoughSpaceWidth = 640 + 2;
+
+constexpr int32_t kHoughMinRadius = 8;
+constexpr int32_t kHoughMaxRadius = 14;
+constexpr int32_t kHoughSpaceRadius = 
+        (kHoughMaxRadius - kHoughMinRadius + 1) + 2;
+
+constexpr size_t kMaxTimeToLive = 100;
+constexpr size_t kMaxEventRate = 10 * kMaxTimeToLive;
 
 namespace hough2map {
 class Detector {
-public:
+ public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  Detector(const ros::NodeHandle &nh, const ros::NodeHandle &nh_private);
+  Detector(const ros::NodeHandle& nh, const ros::NodeHandle& nh_private);
   virtual ~Detector();
 
-protected:
+ protected:
   std::string detector_name_ = "Hough";
 
-private:
-  // Struct for describing a detected line.
-  struct line {
-    int ID;
-    int r;
-    float theta;
-    int theta_idx;
-    double time;
-    bool polarity;
+ private:
+  // Struct for a 2D point
+  struct point {
+    point() : x(0), y(0) {}
+    point(int32_t _x, int32_t _y) : x(_x), y(_y) {}
+    int32_t x, y;
   };
 
-  // Struct for describing a tracked pole.
-  struct pole {
-    double rho;
-    double theta;
-    double t_enter;
-    double t_leave;
-    double t_center;
-    double speed;
-    int ID;
-    bool polarity;
-    double pos_x;
-    double pos_y;
-    double first_observed;
-    float weight;
-  };
+  // Struct for describing a detected circle.
+  struct circle {
+    circle(int32_t _x, int32_t _y, int32_t _r) :
+        x(_x), y(_y), r(_r) {}
 
-  struct utm_coordinate {
-    double x;
-    double y;
-    std::string zone;
-  };
+    bool operator==(const circle& other) const {
+      return (x == other.x) && (y == other.y) && (r == other.r);
+    }
 
-  // Specifying number of threads.
-  static const int kNumThreads = 4;
+    bool operator!=(const circle& other) const {
+      return !operator==(other);
+    }
+
+    bool operator<(const circle& other) const {
+        if (r != other.r) {
+            return r < other.r;
+        } else if (x != other.x) {
+            return x < other.x;
+        } else {
+            return y < other.y;
+        }
+    }
+
+    bool operator>(const circle& other) const {
+        if (r != other.r) {
+            return r > other.r;
+        } else if (x != other.x) {
+            return x > other.x;
+        } else {
+            return y > other.y;
+        }
+    }
+
+    int32_t x, y, r;
+  };
 
   // File Output.
-  const bool file_output_parameter_logging = true;
-
-  const char *lines_file_path = "/tmp/lines.txt";
-  std::ofstream lines_file;
-
-  const char *map_file_path = "/tmp/map.txt";
+  const char* map_file_path = "/tmp/map.txt";
   std::ofstream map_file;
-
-  const char *calibration_file_name = "calibration.yaml";
+  const char* debug_file_path = "/tmp/debug.txt";
+  std::ofstream debug_file;
 
   // Timing debugging.
   double total_events_timing_us;
+  double total_tracking_timing_ms;
   double total_msgs_timing_ms;
   uint64_t total_events;
   uint64_t total_msgs;
 
-  // General Parameters for 1st Hough Transform.
-  static const int kHough1RadiusResolution = 260;
-  static const int kHough1AngularResolution = 21;
-  static const int kHough1MinAngle = -10;
-  static const int kHough1MaxAngle = 10;
+  // Precomputing the squared suppression radius.
+  int hough_nms_radius3_;
 
-  // Precomputing possible angles and their sin/cos values in order to vectorize
-  // the HT.
-  Eigen::VectorXf thetas_1_;
-  Eigen::MatrixXf polar_param_mapping_1_;
+  // Precomputing the square pixel deviations.  
+  std::vector<std::vector<point>> circle_xy;
 
   // Hough transform objects.
-  typedef Eigen::Matrix<int, kHough1RadiusResolution, kHough1AngularResolution>
-      MatrixHough;
-
-  // General parameters for 2nd Hough transform.
-  static const int kHough2AngularResolution = 65;
-  static const int kHough2MinAngle = 1;
-  static const int kHough2MaxAngle = 65;
-  Eigen::VectorXd thetas_2_;
-  Eigen::MatrixXd polar_param_mapping_2_;
-
-  static const int kHough2TimestepsPerMsg = 3;
-  static const int kHough2MsgPerWindow = 100;
+  typedef size_t HoughMatrix[
+        kHoughSpaceRadius][kHoughSpaceHeight][kHoughSpaceWidth];
+  typedef size_t (*HoughMatrixPtr)[kHoughSpaceHeight][kHoughSpaceWidth];
 
   int camera_resolution_width_;
   int camera_resolution_height_;
 
-  const float kAcceptableDistortionRange = 40.0;
   float intrinsics_[4];
   float distortion_coeffs_[4];
-  Eigen::MatrixXf undist_map_x_;
-  Eigen::MatrixXf undist_map_y_;
+
+  cv::Mat image_undist_map_x_;
+  cv::Mat image_undist_map_y_;
+  Eigen::MatrixXf event_undist_map_x_;
+  Eigen::MatrixXf event_undist_map_y_;
+
+  bool filter_dead_pixels_;
+  std::vector<bool> is_dead_pixel_;
 
   // ROS interface.
-  // ros::NodeHandle nh_;
-
   ros::NodeHandle nh_;
   ros::NodeHandle nh_private_;
-  ros::Publisher feature_pub_;
   ros::Subscriber event_sub_;
   ros::Subscriber image_raw_sub_;
 
-  ros::Subscriber GPS_pos_;
-  ros::Subscriber GPS_orient_;
-  ros::Subscriber GPS_vel_;
-
-  /* Function definitions. */
-
   // Callback functions for subscribers.
-  void eventCallback(const dvs_msgs::EventArray::ConstPtr &msg);
-  void positionCallback(const custom_msgs::positionEstimate msg);
-  void velocityCallback(const custom_msgs::velocityEstimate msg);
-  void orientationCallback(const custom_msgs::orientationEstimate msg);
+  void eventCallback(const dvs_msgs::EventArray::ConstPtr& msg);
+  void imageCallback(const sensor_msgs::Image::ConstPtr& msg);
 
   // Functions for Hough transform computation.
-  hough2map::Detector::line addMaxima(int angle, int rad, double time,
-                                      bool pol);
-  void addMaximaInRadius(int i, int radius,
-                         const MatrixHough &total_hough_space,
-                         int local_threshold, bool polarity, double timestamp,
-                         std::vector<hough2map::Detector::line> *new_maxima,
-                         std::vector<int> *new_maxima_value,
-                         bool skip_center = false);
+  void stepHoughTransform(
+      const std::vector<point>& points,
+      HoughMatrixPtr hough_space, std::vector<circle> *last_maxima,
+      bool initialized, std::vector<std::vector<circle>>* maxima_list,
+      std::vector<size_t>* maxima_change);
+
+  void addMaximaInRadius(
+      int32_t r, int32_t y, int32_t x, HoughMatrixPtr hough_space,
+      std::vector<circle>* new_maxima, std::vector<int>* new_maxima_value,
+      bool skip_center = false);
   void applySuppressionRadius(
-      const std::vector<hough2map::Detector::line> &new_maxima,
-      const std::vector<int> &new_maxima_value,
-      std::vector<hough2map::Detector::line> *current_maxima);
+      const std::vector<circle>& candidate_maxima,
+      const std::vector<int>& candidate_maxima_values,
+      std::vector<circle>* maxima);
   template <typename DerivedVec, typename DerivedMat>
-  void initializeSinCosMap(Eigen::EigenBase<DerivedVec> &angles,
-                           Eigen::EigenBase<DerivedMat> &sin_cos_map,
-                           const int kMinAngle, const int kMaxAngle,
-                           const int kNumSteps);
-  bool isLocalMaxima(const Eigen::MatrixXi &hough_space, int i, int radius);
+  void initializeSinCosMap(
+      Eigen::EigenBase<DerivedVec>& angles,
+      Eigen::EigenBase<DerivedMat>& sin_cos_map, const int kMinAngle,
+      const int kMaxAngle, const int kNumSteps);
+  bool isLocalMaxima(HoughMatrixPtr hough_space, int32_t r, int32_t x, int32_t y);
   void newPoleDetection(double rho, double theta, double window_time, bool pol);
-  void hough2nms(const int i, const int j, const Eigen::MatrixXi &hough_2_space,
-                 std::vector<cv::Vec3f> &detections);
-  void computeFullHoughTransform(const int time_step,
-                                 const int nms_recompute_window,
-                                 MatrixHough &total_hough_space_pos,
-                                 MatrixHough &total_hough_space_neg,
-                                 const Eigen::MatrixXi &radii);
-  void updateHoughSpaceVotes(const bool increment, const int event_idx,
-                             const bool pol, const Eigen::MatrixXi &radii,
-                             MatrixHough &hough_space_pos,
-                             MatrixHough &hough_space_neg);
+
+  void computeFullHoughSpace(
+      size_t index, HoughMatrixPtr hough_space, const std::vector<point>& points);
+
   void computeFullNMS(
-      const int time_step, const int nms_recompute_window,
-      const MatrixHough &total_hough_space_pos,
-      const MatrixHough &total_hough_space_neg,
-      std::vector<std::vector<hough2map::Detector::line>> &cur_maxima_list);
-  void itterativeNMS(
-      const int time_step, const int nms_recompute_window,
-      MatrixHough &total_hough_space_pos, MatrixHough &total_hough_space_neg,
-      std::vector<std::vector<hough2map::Detector::line>> &cur_maxima_list,
-      const Eigen::MatrixXi &radii);
-  bool updateIncrementedNMS(
-      const double kTimestamp, const bool polarity, const int kAngle,
-      const int kRadius, const MatrixHough &hough_space,
-      const std::vector<hough2map::Detector::line> &previous_maxima,
-      std::vector<int> &discard,
-      std::vector<hough2map::Detector::line> &new_maxima,
-      std::vector<int> &new_maxima_value);
-  void updateDecrementedNMS(
-      const double kTimestamp, const bool polarity, const int kAngle,
-      const int kRadius, const MatrixHough &hough_space,
-      const std::vector<hough2map::Detector::line> &previous_maxima,
-      std::vector<int> &discard,
-      std::vector<hough2map::Detector::line> &new_maxima,
-      std::vector<int> &new_maxima_value);
-  void
-  secondHoughTransform(const std::vector<std::vector<hough2map::Detector::line>>
-                           &cur_maxima_list);
-  void eventPreProcessing(const dvs_msgs::EventArray::ConstPtr &orig_msg,
-                          Eigen::MatrixXf &points);
+      const HoughMatrixPtr hough_space, std::vector<circle> *maxima);
+  void iterativeNMS(
+      const std::vector<point>& points, HoughMatrixPtr hough_space, 
+      std::vector<std::vector<circle>>* maxima_list,
+      std::vector<size_t>* maxima_change);
+
+  void eventPreProcessing(
+      const dvs_msgs::EventArray::ConstPtr& orig_msg,
+      std::vector<point>* points, std::vector<double>* times);
 
   // Initialisation functions.
   void computeUndistortionMapping();
-  void initializeTransformationMatrices();
   void loadCalibration();
 
-  // Odometry processing functions.
-  utm_coordinate deg2utm(double la, double lo);
-  template <class S, int rows, int cols>
-  Eigen::Matrix<S, rows, cols> queryOdometryBuffer(
-      const double query_time,
-      const std::deque<Eigen::Matrix<S, rows, cols>> &odometry_buffer);
-
   // Visualization functions.
-  void drawPolarCorLine(cv::Mat &image_space, float rho, float theta,
-                        cv::Scalar color);
-  void imageCallback(const sensor_msgs::Image::ConstPtr &msg);
-  void visualizeSecondHoughSpace(const std::vector<cv::Vec3f> &kDetectionsPos,
-                                 const std::vector<cv::Vec3f> &kDetectionsNeg);
-  void visualizeCurrentLineDetections(
-      const std::vector<std::vector<hough2map::Detector::line>>
-          &cur_maxima_list);
+  void drawPolarCorLine(
+      cv::Mat& image_space, float rho, float  theta, cv::Scalar color) const;
+  void visualizeCurrentDetections(
+      const std::vector<point>& points,
+      const std::vector<std::vector<circle>>& maxima_list,
+      const std::vector<size_t>& maxima_change) const;
 
-  std::deque<
-      Eigen::Matrix<int, kHough1RadiusResolution, kHough2TimestepsPerMsg>>
-      hough2_queue_pos_;
-  std::deque<
-      Eigen::Matrix<int, kHough1RadiusResolution, kHough2TimestepsPerMsg>>
-      hough2_queue_neg_;
+  // For the very first message we need separate processing (e.g. a full HT).
+  bool initialized;
+  HoughMatrixPtr hough_space;
 
-  // Events from the previous dvs_msg need to be carried over to start of the
-  // Hough computation of the next events. This basically ensures a continous
-  // sliding window.
-  dvs_msgs::EventArray feature_msg_;
+  std::vector<circle> last_maxima;
+  std::vector<point> last_points;
+  std::vector<double> last_times;
 
-  // Odometry.
-  std::deque<Eigen::Vector3d> raw_gps_buffer_;
-  std::deque<Eigen::Vector3d> velocity_buffer_;
-  std::deque<Eigen::Vector2d> orientation_buffer_;
+  size_t num_messages;
+  std::queue<size_t> (*filter_grid_)[kHoughSpaceWidth];
 
-  // Transformation matrix (in [m]) between train and sensors for triangulation.
-  Eigen::Matrix3d C_camera_train_;
-  Eigen::Matrix3d gps_offset_;
-  Eigen::Matrix3d camera_train_offset_;
-
-  // Storing the current result of the non-max-suppression.
+  // Image to display the events on for visualization purposes only.
   cv::Mat cur_greyscale_img_;
-};
-} // namespace hough2map
 
-#endif // HOUGH2MAP_DETECTOR_H_
+  // Tracking parameters
+  int32_t tracking_angle_step;
+  int32_t tracking_pixel_step;
+  double tracking_max_jump;
+  size_t tracking_mean_window;
+
+  struct track_point {
+    double pixel;
+    double angle;
+    double time;
+
+    track_point() : pixel(-1.0), angle(-1.0), time(-1.0) {}
+
+    track_point(double _pixel, double _angle, double _time) :
+        pixel(_pixel), angle(_angle), time(_time) {}
+  };
+
+  size_t next_track_id;
+  std::map<size_t, std::vector<track_point>> tracks;
+
+  double start_time;
+};
+}  // namespace hough2map
+
+#endif  // HOUGH2MAP_DETECTOR_H_
